@@ -1,0 +1,12 @@
+streamlit
+opencv-python-headless==4.7.0.72
+scikit-learn
+streamlit
+streamlit-webrtc
+av
+mediapipe==0.10.5
+opencv-python-headless
+numpy
+pandas
+scikit-learn
+joblib
