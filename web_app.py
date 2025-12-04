@@ -1,14 +1,13 @@
 import streamlit as st
-import cv2
 import mediapipe as mp
 import numpy as np
 import joblib
 import time
 import os
+import importlib  # NEW: for lazy cv2 import
 
 # NEW: import streamlit-webrtc for browser-based webcam on Streamlit Cloud
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
-
 
 SESSION_DIR = "sessions"
 os.makedirs(SESSION_DIR, exist_ok=True)
@@ -30,39 +29,26 @@ def angle_between(a, b, c):
 
 
 # STREAMLIT UI
-
 st.set_page_config(page_title="AI Fitness Trainer", layout="centered")
 
 st.title("Fitness Trainer")
 st.write("Turn on the camera to start exercise detection.")
 
-# CHANGED: we don't use a manual while-loop checkbox any more
 run = st.checkbox("Start Camera")
-
 hide_video = st.checkbox("Hide Camera Preview")
-
-# CHANGED: this is now only used for showing a static frame if needed
 FRAME_WINDOW = st.empty()
-
 
 # STATE VARs
 if "push_count" not in st.session_state:
     st.session_state.push_count = 0
-
 if "squat_count" not in st.session_state:
     st.session_state.squat_count = 0
-
 if "push_stage" not in st.session_state:
     st.session_state.push_stage = "up"
-
 if "squat_stage" not in st.session_state:
     st.session_state.squat_stage = "up"
-
-# CHANGED: recording flag now used with WebRTC recording
 if "recording" not in st.session_state:
     st.session_state.recording = False
-
-# NEW: store latest exercise label in state
 if "exercise_label" not in st.session_state:
     st.session_state.exercise_label = "no_pose"
 
@@ -77,72 +63,71 @@ def get_next_session_filename():
         i += 1
 
 
-# NEW: Video transformer for streamlit-webrtc
+# MODIFIED: Video transformer with LAZY cv2 import
 class FitnessVideoTransformer(VideoTransformerBase):
     """
-    This class processes each incoming video frame from the browser webcam.
-    It replaces the manual OpenCV while-loop and keeps all logic:
-    - pose detection
-    - exercise classification
-    - rep counting
-    - drawing overlays
+    Processes each webcam frame with lazy cv2 import to fix Streamlit Cloud.
+    Keeps ALL features: pose detection, exercise classification, rep counting, recording.
     """
 
     def __init__(self):
-        # Create a single MediaPipe pose instance per transformer
+        # Create MediaPipe pose instance
         self.pose = mp_pose.Pose(
             min_detection_confidence=0.5, min_tracking_confidence=0.5
         )
-
-        # Prepare recording file on first use
+        
+        # NEW: cv2 is lazily loaded only when first frame arrives
+        self.cv2 = None
+        
+        # Video writer setup
+        self.video_writer = None
+        self.record_filename = None
         if not st.session_state.recording:
-            filename = os.path.join(SESSION_DIR, get_next_session_filename())
-            # Use a default fps (WebRTC does not give us exact fps easily)
-            fps = 30
-            # Width and height will be updated when first frame arrives
-            self.video_writer = None
-            self.record_filename = filename
+            self.record_filename = os.path.join(SESSION_DIR, get_next_session_filename())
             st.session_state.recording = True
-        else:
-            self.video_writer = None
-            self.record_filename = None
+
+    def _lazy_import_cv2(self):
+        """NEW: Import cv2 only when first frame needs it (fixes Streamlit Cloud)"""
+        if self.cv2 is None:
+            self.cv2 = importlib.import_module('cv2')
+        return self.cv2
 
     def _init_writer_if_needed(self, frame_array):
-        """
-        Lazily initialize the VideoWriter once we know frame size.
-        """
-        if self.video_writer is None and st.session_state.recording:
+        """Initialize VideoWriter once frame size is known"""
+        if self.video_writer is None and self.record_filename:
+            cv2 = self._lazy_import_cv2()
             height, width, _ = frame_array.shape
             self.video_writer = cv2.VideoWriter(
                 self.record_filename,
                 cv2.VideoWriter_fourcc(*"mp4v"),
-                30,
+                30,  # Fixed FPS for WebRTC
                 (width, height),
             )
 
     def recv(self, frame):
-        """
-        This method is called for each video frame.
-        `frame` is a VideoFrame from streamlit-webrtc.
-        """
-        # Convert from WebRTC frame to OpenCV BGR image
+        """Process each incoming video frame"""
+        # Convert WebRTC frame to numpy array (BGR format)
         img = frame.to_ndarray(format="bgr24")
-
-        # Initialize writer with correct size
+        
+        # NEW: Get cv2 reference safely
+        cv2 = self._lazy_import_cv2()
+        
+        # Initialize recording with correct frame size
         self._init_writer_if_needed(img)
-
-        # Write raw frame to file if recording
+        
+        # Write frame to video file if recording
         if self.video_writer is not None:
             self.video_writer.write(img)
 
+        # Process frame (copy for drawing)
         display_frame = img.copy()
         rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         results = self.pose.process(rgb)
 
         label = "no_pose"
-
-        # looking for visibility of all landmarks
         landmarks_present = False
+
+        # Check landmark visibility (same logic as original)
         if results.pose_landmarks:
             lm = results.pose_landmarks.landmark
             if (
@@ -153,12 +138,13 @@ class FitnessVideoTransformer(VideoTransformerBase):
             ):
                 landmarks_present = True
 
-        # exercise only when the pose is recognized
+        # Exercise detection and counting (EXACT SAME LOGIC AS ORIGINAL)
         if landmarks_present:
             lm = results.pose_landmarks.landmark
             h, w, _ = display_frame.shape
             landmarks = [[p.x * w, p.y * h, p.z] for p in lm]
 
+            # ML classification
             ml_input = (
                 np.array([[p.x, p.y, p.z] for p in lm])
                 .flatten()
@@ -166,39 +152,38 @@ class FitnessVideoTransformer(VideoTransformerBase):
             )
             label = clf.predict(ml_input)[0]
 
+            # Pushup counting (elbow angle)
             elbow_angle = angle_between(
                 landmarks[11][:2],
                 landmarks[13][:2],
                 landmarks[15][:2],
             )
-
             if elbow_angle > 150:
                 st.session_state.push_stage = "up"
             if elbow_angle < 90 and st.session_state.push_stage == "up":
                 st.session_state.push_stage = "down"
                 st.session_state.push_count += 1
 
+            # Squat counting (knee angle)
             knee_angle = angle_between(
                 landmarks[23][:2],
                 landmarks[25][:2],
                 landmarks[27][:2],
             )
-
             if knee_angle > 160:
                 st.session_state.squat_stage = "up"
-            if (
-                knee_angle < 100
-                and st.session_state.squat_stage == "up"
-            ):
+            if knee_angle < 100 and st.session_state.squat_stage == "up":
                 st.session_state.squat_stage = "down"
                 st.session_state.squat_count += 1
 
+            # Draw pose landmarks
             mp_drawing.draw_landmarks(
                 display_frame,
                 results.pose_landmarks,
                 mp_pose.POSE_CONNECTIONS,
             )
         else:
+            # Warning when pose not fully visible
             cv2.putText(
                 display_frame,
                 "Pose not fully visible",
@@ -209,10 +194,10 @@ class FitnessVideoTransformer(VideoTransformerBase):
                 2,
             )
 
-        # Store label in session so UI can display it
+        # Store current exercise label
         st.session_state.exercise_label = str(label)
 
-        # Draw overlay texts (exercise + counters)
+        # Draw overlay text (same as original)
         cv2.putText(
             display_frame,
             f"Exercise: {label}",
@@ -222,7 +207,6 @@ class FitnessVideoTransformer(VideoTransformerBase):
             (0, 255, 0),
             3,
         )
-
         cv2.putText(
             display_frame,
             f"Pushups: {st.session_state.push_count}",
@@ -232,7 +216,6 @@ class FitnessVideoTransformer(VideoTransformerBase):
             (255, 0, 0),
             3,
         )
-
         cv2.putText(
             display_frame,
             f"Squats: {st.session_state.squat_count}",
@@ -243,45 +226,49 @@ class FitnessVideoTransformer(VideoTransformerBase):
             3,
         )
 
-        # If user wants to hide preview, return a black frame
+        # Hide preview option (returns black frame but keeps counting)
         if hide_video:
-            black = np.zeros_like(display_frame)
-            return black
-        else:
-            return display_frame
+            black_frame = np.zeros_like(display_frame)
+            return black_frame
+        return display_frame
 
     def __del__(self):
-        """
-        Ensure video writer is released when transformer is destroyed.
-        """
-        if hasattr(self, "video_writer") and self.video_writer is not None:
+        """Clean up video writer"""
+        if hasattr(self, 'video_writer') and self.video_writer is not None:
+            cv2 = self._lazy_import_cv2()
             self.video_writer.release()
 
 
-# CAMERA / WEBRTC SECTION
-
+# MAIN UI
 if run:
-    # NEW: create a WebRTC-based video streamer instead of cv2.VideoCapture
+    # WebRTC streamer (browser webcam)
     webrtc_ctx = webrtc_streamer(
         key="fitness-webrtc",
-        mode=WebRtcMode.SENDRECV,  # send and receive video
+        mode=WebRtcMode.SENDRECV,
         video_transformer_factory=FitnessVideoTransformer,
         media_stream_constraints={"video": True, "audio": False},
-        async_transform=True,  # process frames asynchronously for better performance
+        async_transform=True,
     )
 
-    # Show current counts and label under the video
-    st.write(f"Current exercise: {st.session_state.exercise_label}")
-    st.write(f"Pushups counted: {st.session_state.push_count}")
-    st.write(f"Squats counted: {st.session_state.squat_count}")
+    # Live stats display
+    st.write(f"**Current exercise**: {st.session_state.exercise_label}")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Pushups", st.session_state.push_count)
+    with col2:
+        st.metric("Squats", st.session_state.squat_count)
 
-    # Info text about recording location
+    # Recording info
     st.info(
-        "Session video is being saved in the 'sessions' folder in the app "
-        "filesystem (note: on Streamlit Cloud, files are temporary per session)."
+        f"✅ Recording to: `{os.path.basename(st.session_state.get('record_filename', 'session.mp4'))}` "
+        f"in `/sessions/` folder\n"
+        f"*(Streamlit Cloud: files temporary per session)*"
     )
 else:
-    # When camera is off, show last known counts
-    st.write(f"Last exercise: {st.session_state.exercise_label}")
-    st.write(f"Total pushups: {st.session_state.push_count}")
-    st.write(f"Total squats: {st.session_state.squat_count}")
+    # Show stats when camera off
+    st.write(f"**Last exercise**: {st.session_state.exercise_label}")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Total Pushups", st.session_state.push_count)
+    with col2:
+        st.metric("Total Squats", st.session_state.squat_count)
